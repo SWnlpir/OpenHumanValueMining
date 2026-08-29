@@ -1,6 +1,6 @@
 # Open Human Value Mining
 
-This repository contains the official code release for the Open Human Value Mining
+This repository contains the code release for the Open Human Value Mining
 pipeline. The implementation focuses on the main algorithmic components used
 for argument-tree extraction, value-semantic decomposition, consensus
 clustering, evaluation, and cluster evidence selection.
@@ -31,27 +31,6 @@ API-based scripts require an OpenAI-compatible chat-completions endpoint:
 export OPENAI_API_KEY="YOUR_KEY"
 export OPENAI_BASE_URL="https://api.openai.com/v1"
 export OPENAI_MODEL="gpt-4.1-mini-2025-04-14"
-```
-
-## Quick Checks Without Data Or API Calls
-
-This release does not include sample data. The following commands check that the
-scripts import and expose their command-line interfaces without requiring an API
-key or dataset files:
-
-```bash
-python -m py_compile \
-  argument_tree_extraction.py \
-  value_decomposition.py \
-  consensus_clustering.py \
-  evaluation.py \
-  cluster_evidence_selection.py
-
-python argument_tree_extraction.py --help
-python value_decomposition.py --help
-python consensus_clustering.py --help
-python evaluation.py --help
-python cluster_evidence_selection.py --help
 ```
 
 ## Full Pipeline Commands
@@ -88,7 +67,5 @@ The main clustering view used in the paper is `goal,principle,tradeoff,perspecti
 
 ## Notes
 
-This repository excludes private paths, API keys, generated intermediate files,
-non-essential experiment scripts, sample data, and full experimental datasets.
-Access to the full dataset may require permission from its creator; please visit
+Access to the full dataset requires permission from its creator; please visit
 the dataset project page to obtain it.
