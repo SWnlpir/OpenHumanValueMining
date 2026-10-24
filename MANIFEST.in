@@ -1,0 +1,3 @@
+include ENVIRONMENT.md
+include .env.example
+include requirements.txt

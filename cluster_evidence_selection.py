@@ -1,21 +1,12 @@
 #!/usr/bin/env python3
 import argparse
-import json
 from pathlib import Path
 from typing import Any
 
 import numpy as np
 import pandas as pd
 
-
-def read_jsonl(path: Path) -> list[dict[str, Any]]:
-    rows = []
-    with path.open("r", encoding="utf-8") as f:
-        for line in f:
-            line = line.strip()
-            if line:
-                rows.append(json.loads(line))
-    return rows
+from ohvm_runtime import cli_entry, positive_int, read_jsonl
 
 
 def l2_normalize(x: np.ndarray) -> np.ndarray:
@@ -24,8 +15,10 @@ def l2_normalize(x: np.ndarray) -> np.ndarray:
     return x / norms
 
 
-def key(row: dict[str, Any]) -> str:
-    return f"{row.get('pack_id')}::{row.get('edge_id')}"
+def key(row: dict[str, Any]) -> tuple[str, str]:
+    if row.get("pack_id") is None or row.get("edge_id") is None:
+        raise ValueError("Every pair and cluster row requires pack_id and edge_id")
+    return str(row["pack_id"]), str(row["edge_id"])
 
 
 def build_view_embedding(embedding_dir: Path, dims: list[str]) -> np.ndarray:
@@ -97,16 +90,20 @@ def main() -> None:
     parser.add_argument("--embedding-npy", default=None)
     parser.add_argument("--embedding-dir", default=None)
     parser.add_argument("--dims", default="goal,principle,tradeoff,perspective")
-    parser.add_argument("--top-k", type=int, default=5)
+    parser.add_argument("--top-k", type=positive_int, default=5)
     args = parser.parse_args()
 
     cluster_rows = read_jsonl(Path(args.clusters_jsonl))
     pair_rows = read_jsonl(Path(args.pairs_jsonl))
     pair_map = {key(row): row for row in pair_rows}
     ordered_keys = [key(row) for row in cluster_rows]
+    if not ordered_keys:
+        raise ValueError("No cluster rows found")
+    if len(pair_map) != len(pair_rows) or len(set(ordered_keys)) != len(ordered_keys):
+        raise ValueError("Duplicate (pack_id, edge_id) keys in pairs or clusters")
     missing = [k for k in ordered_keys if k not in pair_map]
     if missing:
-        raise KeyError(f"Missing pair rows for {len(missing)} cluster entries; first={missing[0]}")
+        raise ValueError(f"Missing pair rows for {len(missing)} cluster entries; first={missing[0]}")
 
     if args.embedding_npy:
         vecs = l2_normalize(np.load(args.embedding_npy).astype(np.float32))
@@ -115,10 +112,12 @@ def main() -> None:
             raise ValueError("Either --embedding-npy or --embedding-dir must be provided.")
         dims = [x.strip() for x in args.dims.split(",") if x.strip()]
         vecs = build_view_embedding(Path(args.embedding_dir), dims)
-    if vecs.shape[0] != len(cluster_rows):
-        raise ValueError("Embedding rows must align with clusters-jsonl rows.")
+    if vecs.ndim != 2 or vecs.shape[0] != len(cluster_rows) or not np.isfinite(vecs).all():
+        raise ValueError("Embeddings must be a finite 2-D matrix aligned with clusters-jsonl rows")
 
     labels = np.array([int(row["cluster_id"]) for row in cluster_rows], dtype=np.int32)
+    if set(labels) != set(range(int(labels.max()) + 1)):
+        raise ValueError("Cluster IDs must be consecutive non-negative integers starting at 0")
     conf_intra = np.array([float(row.get("conf_intra", 0.0)) for row in cluster_rows], dtype=np.float32)
     conf_ratio = np.array([float(row.get("conf_ratio", 0.0)) for row in cluster_rows], dtype=np.float32)
     n_clusters = int(labels.max()) + 1
@@ -159,8 +158,9 @@ def main() -> None:
 
     output = Path(args.output_csv)
     output.parent.mkdir(parents=True, exist_ok=True)
-    pd.DataFrame(rows).to_csv(output, index=False)
+    pd.DataFrame(rows).to_csv(output, index=False, encoding="utf-8-sig")
+    print(f"Evidence saved to {output}", flush=True)
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(cli_entry(main))

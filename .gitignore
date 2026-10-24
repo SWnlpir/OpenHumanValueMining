@@ -4,3 +4,12 @@ __pycache__/
 .DS_Store
 sample_outputs/
 .env
+.env.*
+!.env.example
+.venv/
+outputs/
+*.checkpoint.sqlite3*
+.pytest_cache/
+*.egg-info/
+build/
+dist/

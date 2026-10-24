@@ -1,19 +1,14 @@
 #!/usr/bin/env python3
 import argparse
 import json
-import os
-import re
-import time
 from collections import deque
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any
 
-from openai import OpenAI
-
-MODEL = os.getenv("OPENAI_MODEL", "gpt-4.1-mini-2025-04-14")
-BASE_URL = os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1")
-API_KEY = os.getenv("OPENAI_API_KEY", "")
+from ohvm_runtime import (
+    add_api_arguments, call_json, check_api, cli_entry, configure_api,
+    paragraph_rows, positive_int, run_batch,
+)
 
 STEP1_PROMPT = """You are an argument structure annotator.
 
@@ -95,59 +90,6 @@ Rules:
 - Use 0-3 premises for each target.
 - Output JSON only.
 """
-
-
-def client() -> OpenAI:
-    if not API_KEY:
-        raise RuntimeError("OPENAI_API_KEY is required for extraction.")
-    return OpenAI(api_key=API_KEY, base_url=BASE_URL)
-
-
-def read_jsonl(path: Path) -> list[dict[str, Any]]:
-    rows = []
-    with path.open("r", encoding="utf-8") as f:
-        for line in f:
-            line = line.strip()
-            if line:
-                rows.append(json.loads(line))
-    return rows
-
-
-def write_jsonl(path: Path, rows: list[dict[str, Any]]) -> None:
-    with path.open("w", encoding="utf-8") as f:
-        for row in rows:
-            f.write(json.dumps(row, ensure_ascii=False) + "\n")
-
-
-def clean_json(text: str) -> str:
-    text = (text or "").strip()
-    if text.startswith("```"):
-        text = re.sub(r"^```(?:json)?", "", text).strip()
-        text = re.sub(r"```$", "", text).strip()
-    start = min([i for i in [text.find("{"), text.find("[")] if i >= 0], default=0)
-    return text[start:].strip()
-
-
-def call_json(prompt: str, temperature: float, timeout: int, retries: int) -> dict[str, Any]:
-    llm = client()
-    last_error = None
-    for attempt in range(retries):
-        try:
-            resp = llm.chat.completions.create(
-                model=MODEL,
-                temperature=temperature,
-                messages=[{"role": "user", "content": prompt}],
-                timeout=timeout,
-            )
-            content = resp.choices[0].message.content or ""
-            obj = json.loads(clean_json(content))
-            if isinstance(obj, dict):
-                return obj
-            last_error = "non_object_json"
-        except Exception as exc:
-            last_error = str(exc)
-            time.sleep(min(2 ** attempt, 8))
-    raise RuntimeError(f"LLM JSON call failed: {last_error}")
 
 
 def normalize_units(raw: Any) -> list[dict[str, str]]:
@@ -332,39 +274,27 @@ def extract_paragraph(row: dict[str, Any], args: argparse.Namespace) -> dict[str
     return out
 
 
-def main() -> None:
+def main() -> int:
     parser = argparse.ArgumentParser(description="Tree-constrained argument extraction.")
     parser.add_argument("--input-jsonl", required=True)
     parser.add_argument("--output-jsonl", required=True)
     parser.add_argument("--failed-jsonl", default=None)
     parser.add_argument("--text-field", default="paragraph_text")
-    parser.add_argument("--workers", type=int, default=4)
-    parser.add_argument("--retries", type=int, default=3)
-    parser.add_argument("--timeout", type=int, default=120)
-    parser.add_argument("--temperature", type=float, default=0.0)
-    parser.add_argument("--batch-size", type=int, default=4)
+    parser.add_argument("--batch-size", type=positive_int, default=4)
+    add_api_arguments(parser)
     args = parser.parse_args()
 
-    rows = read_jsonl(Path(args.input_jsonl))
+    context = configure_api(args)
+    context.update(step="extraction", text_field=args.text_field, batch_size=args.batch_size,
+                   prompts=[STEP1_PROMPT, STEP2_PROMPT, STEP3_PROMPT])
     output = Path(args.output_jsonl)
     failed = Path(args.failed_jsonl) if args.failed_jsonl else output.with_suffix(".failed.jsonl")
-    output.parent.mkdir(parents=True, exist_ok=True)
-    failed.parent.mkdir(parents=True, exist_ok=True)
-
-    results: list[Optional[dict[str, Any]]] = [None] * len(rows)
-    failures: list[dict[str, Any]] = []
-    with ThreadPoolExecutor(max_workers=args.workers) as pool:
-        futures = {pool.submit(extract_paragraph, row, args): (idx, row) for idx, row in enumerate(rows)}
-        for future in as_completed(futures):
-            idx, src = futures[future]
-            try:
-                results[idx] = future.result()
-            except Exception as exc:
-                failures.append({"source": src, "error": str(exc)})
-
-    write_jsonl(output, [row for row in results if row is not None])
-    write_jsonl(failed, failures)
+    if Path(args.input_jsonl).resolve() in {output.resolve(), failed.resolve(), output.with_suffix(".checkpoint.sqlite3").resolve()}:
+        raise ValueError("Input and output paths must be different")
+    return run_batch(lambda: paragraph_rows(args.input_jsonl, args.text_field),
+                     lambda row: extract_paragraph(row, args), output, failed, args.workers,
+                     context, args.resume, args.overwrite, check_api)
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(cli_entry(main))

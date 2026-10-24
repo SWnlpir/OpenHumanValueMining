@@ -9,6 +9,8 @@ from scipy import sparse
 from sklearn.cluster import KMeans, SpectralClustering
 from sklearn.metrics import silhouette_score
 
+from ohvm_runtime import cli_entry, digest, positive_int, read_jsonl, write_json, write_jsonl
+
 DIM_FIELDS = {
     "goal": "goal",
     "final_goal": "final_goal",
@@ -20,23 +22,6 @@ DIM_FIELDS = {
     "norm": "norm",
     "perspective": "perspective",
 }
-
-
-def read_jsonl(path: Path) -> list[dict[str, Any]]:
-    rows = []
-    with path.open("r", encoding="utf-8") as f:
-        for line in f:
-            line = line.strip()
-            if line:
-                rows.append(json.loads(line))
-    return rows
-
-
-def write_jsonl(path: Path, rows: list[dict[str, Any]]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w", encoding="utf-8") as f:
-        for row in rows:
-            f.write(json.dumps(row, ensure_ascii=False) + "\n")
 
 
 def l2_normalize(x: np.ndarray) -> np.ndarray:
@@ -66,22 +51,31 @@ def dimension_text(row: dict[str, Any], dim: str) -> str:
 
 
 def build_embeddings(rows: list[dict[str, Any]], dims: list[str], model_name: str, out_dir: Path, batch_size: int) -> dict[str, np.ndarray]:
+    out_dir.mkdir(parents=True, exist_ok=True)
+    expected = embedding_signature(rows, dims, model_name)
+    manifest = out_dir / "manifest.json"
+    reusable = manifest.exists() and json.loads(manifest.read_text(encoding="utf-8")) == expected
+    if reusable and all((out_dir / f"{dim}.npy").is_file() for dim in dims):
+        return load_embeddings(out_dir, dims)
     from sentence_transformers import SentenceTransformer
 
-    out_dir.mkdir(parents=True, exist_ok=True)
     model = SentenceTransformer(model_name)
     vecs = {}
+    # Remove the completion marker before replacing any arrays.
+    manifest.unlink(missing_ok=True)
     for dim in dims:
         path = out_dir / f"{dim}.npy"
-        if path.exists():
-            vecs[dim] = np.load(path)
-            continue
         texts = [dimension_text(row, dim) for row in rows]
         arr = model.encode(texts, batch_size=batch_size, normalize_embeddings=True, show_progress_bar=True)
         arr = np.asarray(arr, dtype=np.float32)
         np.save(path, arr)
         vecs[dim] = arr
+    write_json(manifest, expected)
     return vecs
+
+
+def embedding_signature(rows, dims, model_name):
+    return {"model": model_name, "dims": dims, "input_digest": digest(rows)}
 
 
 def load_embeddings(embedding_dir: Path, dims: list[str]) -> dict[str, np.ndarray]:
@@ -191,7 +185,13 @@ def cluster_summary(labels: np.ndarray, vecs: np.ndarray) -> dict[str, Any]:
         "cluster_sizes": {str(i): int(v) for i, v in enumerate(counts)},
     }
     if len(counts) > 1 and min(counts) > 1:
-        summary["silhouette"] = float(silhouette_score(vecs, labels, metric="cosine"))
+        indices = np.random.RandomState(0).permutation(len(labels))[:5000] if len(labels) > 5000 else np.arange(len(labels))
+        sampled_labels = labels[indices]
+        summary["silhouette"] = (
+            float(silhouette_score(vecs[indices], sampled_labels, metric="cosine"))
+            if 1 < len(np.unique(sampled_labels)) < len(indices) else None
+        )
+        summary["silhouette_sample_size"] = min(len(labels), 5000)
     return summary
 
 
@@ -200,32 +200,58 @@ def main() -> None:
     parser.add_argument("--input-jsonl", required=True)
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--dims", default="goal,principle,tradeoff,perspective")
-    parser.add_argument("--k-final", type=int, required=True)
+    parser.add_argument("--k-final", type=positive_int, required=True)
     parser.add_argument("--k-base", default=None, help="Comma-separated K values for base partitions.")
     parser.add_argument("--seeds", default="11,23,37,51,67")
     parser.add_argument("--bootstrap", type=int, default=2)
     parser.add_argument("--bootstrap-frac", type=float, default=0.8)
-    parser.add_argument("--knn", type=int, default=50)
-    parser.add_argument("--min-observed", type=int, default=2)
+    parser.add_argument("--knn", type=positive_int, default=50)
+    parser.add_argument("--min-observed", type=positive_int, default=2)
     parser.add_argument("--embedding-dir", default=None)
     parser.add_argument("--embedding-model", default="BAAI/bge-m3")
-    parser.add_argument("--batch-size", type=int, default=64)
+    parser.add_argument("--batch-size", type=positive_int, default=64)
     args = parser.parse_args()
 
     rows = read_jsonl(Path(args.input_jsonl))
     dims = parse_list(args.dims)
+    n = len(rows)
+    if not 2 <= args.k_final < n:
+        raise ValueError(f"--k-final must satisfy 2 <= K < number of edges ({n})")
+    if not dims or len(set(dims)) != len(dims) or any(dim not in DIM_FIELDS for dim in dims):
+        raise ValueError(f"--dims must contain unique fields from: {', '.join(DIM_FIELDS)}")
+    if args.bootstrap < 0 or not 0 < args.bootstrap_frac <= 1:
+        raise ValueError("--bootstrap must be >= 0 and --bootstrap-frac must be in (0, 1]")
+    ids = [(row.get("pack_id"), row.get("edge_id")) for row in rows]
+    if any(a is None or b is None for a, b in ids) or len(set(ids)) != n:
+        raise ValueError("Each value row requires a unique (pack_id, edge_id)")
+    for index, row in enumerate(rows, 1):
+        if not isinstance(row.get("attributes"), dict) or any(not dimension_text(row, dim) for dim in dims):
+            raise ValueError(f"Record {index}: missing value attributes for selected dimensions")
+    k_values = parse_list(args.k_base, int) if args.k_base else sorted({args.k_final - 2, args.k_final, args.k_final + 2})
+    if args.k_base and (not k_values or any(k < 2 or k > n for k in k_values)):
+        raise ValueError(f"--k-base values must be between 2 and {n}")
+    k_values = [k for k in k_values if 2 <= k <= n]
+    seeds = parse_list(args.seeds, int)
+    if not seeds or any(seed < 0 or seed >= 2 ** 32 for seed in seeds):
+        raise ValueError("--seeds requires integers in [0, 2**32)")
+    if args.min_observed > len(k_values) * len(seeds) * (1 + args.bootstrap):
+        raise ValueError("--min-observed exceeds the total number of base partitions")
     out_dir = Path(args.output_dir)
     emb_dir = Path(args.embedding_dir) if args.embedding_dir else out_dir / "embeddings"
-    if emb_dir.exists() and all((emb_dir / f"{dim}.npy").exists() for dim in dims):
+    if args.embedding_dir:
+        manifest = emb_dir / "manifest.json"
+        if manifest.exists() and json.loads(manifest.read_text(encoding="utf-8")) != embedding_signature(rows, dims, args.embedding_model):
+            raise ValueError("Embedding manifest does not match the input rows, dimensions or model")
         dim_vecs = load_embeddings(emb_dir, dims)
     else:
         dim_vecs = build_embeddings(rows, dims, args.embedding_model, emb_dir, args.batch_size)
 
+    for dim, arr in dim_vecs.items():
+        if arr.ndim != 2 or arr.shape[0] != n or arr.shape[1] < 1 or not np.isfinite(arr).all():
+            raise ValueError(f"{dim}.npy must be a finite 2-D matrix with {n} rows")
     vecs = make_view_embedding(dim_vecs, dims)
-    k_values = parse_list(args.k_base, int) if args.k_base else sorted(set([args.k_final - 2, args.k_final, args.k_final + 2]))
-    k_values = [k for k in k_values if k > 1]
-    seeds = parse_list(args.seeds, int)
 
+    print(f"Clustering {n} edges; dimensions: {', '.join(dims)}; K={args.k_final}", flush=True)
     edges = knn_candidates(vecs, args.knn, args.batch_size)
     partitions = build_partitions(vecs, k_values, seeds, args.bootstrap, args.bootstrap_frac)
     affinity = consensus_matrix(partitions, edges, vecs.shape[0], args.min_observed)
@@ -254,7 +280,8 @@ def main() -> None:
     sparse.save_npz(out_dir / "consensus_affinity.npz", affinity)
     with (out_dir / "cluster_summary.json").open("w", encoding="utf-8") as f:
         json.dump(cluster_summary(labels, vecs), f, indent=2, ensure_ascii=False)
+    print(f"Clustering outputs saved to {out_dir}", flush=True)
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(cli_entry(main))

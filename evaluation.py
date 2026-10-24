@@ -9,15 +9,13 @@ import numpy as np
 from scipy.optimize import linear_sum_assignment
 from sklearn.metrics import roc_auc_score, silhouette_score
 
+from ohvm_runtime import cli_entry, positive_int, read_jsonl, write_json
 
-def read_jsonl(path: Path) -> list[dict[str, Any]]:
-    rows = []
-    with path.open("r", encoding="utf-8") as f:
-        for line in f:
-            line = line.strip()
-            if line:
-                rows.append(json.loads(line))
-    return rows
+
+def report(result, args):
+    if args.output_json:
+        write_json(args.output_json, result)
+    print(json.dumps(result, indent=2, ensure_ascii=False))
 
 
 def l2_normalize(x: np.ndarray) -> np.ndarray:
@@ -44,7 +42,7 @@ def extract_edges(rows: list[dict[str, Any]], edge_key: str) -> list[dict[str, A
             for u in row.get("units") or row.get("units_pred") or []
             if isinstance(u, dict)
         }
-        pair_list = row.get(edge_key) or row.get("pairs") or row.get("pairs_pred") or row.get("gold_edges")
+        pair_list = row[edge_key] if edge_key in row else row.get("pairs", row.get("pairs_pred", row.get("gold_edges")))
         if isinstance(pair_list, list):
             for idx, edge in enumerate(pair_list, 1):
                 if not isinstance(edge, dict):
@@ -161,17 +159,24 @@ def evaluate_edges(args: argparse.Namespace) -> None:
         "f1": f1,
         "soft_f1": soft_f1,
     }
-    print(json.dumps(result, indent=2, ensure_ascii=False))
+    report(result, args)
 
 
 def load_cluster_labels(path: Path) -> np.ndarray:
     rows = read_jsonl(path)
-    return np.array([int(r["cluster_id"]) for r in rows], dtype=np.int32)
+    if not rows or any("cluster_id" not in row for row in rows):
+        raise ValueError("Cluster file must contain non-empty rows with cluster_id")
+    labels = np.array([int(r["cluster_id"]) for r in rows], dtype=np.int32)
+    if (labels < 0).any():
+        raise ValueError("cluster_id must be non-negative")
+    return labels
 
 
 def evaluate_cluster_summary(args: argparse.Namespace) -> None:
     labels = load_cluster_labels(Path(args.clusters_jsonl))
     vecs = l2_normalize(np.load(args.embedding_npy).astype(np.float32))
+    if vecs.ndim != 2 or vecs.shape[0] != len(labels) or not np.isfinite(vecs).all():
+        raise ValueError("Embedding matrix must be finite and align with cluster rows")
     counts = np.bincount(labels)
     out = {
         "n_samples": int(labels.shape[0]),
@@ -181,7 +186,7 @@ def evaluate_cluster_summary(args: argparse.Namespace) -> None:
     }
     if len(counts) > 1 and min(counts) > 1:
         out["silhouette_cosine"] = float(silhouette_score(vecs, labels, metric="cosine"))
-    print(json.dumps(out, indent=2, ensure_ascii=False))
+    report(out, args)
 
 
 def parse_label_vector(value: Any) -> Optional[np.ndarray]:
@@ -240,7 +245,7 @@ def evaluate_external_alignment(args: argparse.Namespace) -> None:
         "diff_mean_cos": float(np.mean(diff_scores)),
         "auc_cos": float(roc_auc_score(auc_y, auc_s)) if len(set(auc_y)) == 2 else None,
     }
-    print(json.dumps(out, indent=2, ensure_ascii=False))
+    report(out, args)
 
 
 def main() -> None:
@@ -254,21 +259,24 @@ def main() -> None:
     edge.add_argument("--gold-key", default="pairs")
     edge.add_argument("--threshold", type=float, default=0.7)
     edge.add_argument("--embedding-model", default="BAAI/bge-m3")
-    edge.add_argument("--batch-size", type=int, default=64)
+    edge.add_argument("--batch-size", type=positive_int, default=64)
     edge.add_argument("--ignore-stance", action="store_true")
+    edge.add_argument("--output-json", help="Save evaluation metrics as JSON")
     edge.set_defaults(func=evaluate_edges)
 
     cluster = sub.add_parser("cluster-summary")
     cluster.add_argument("--clusters-jsonl", required=True)
     cluster.add_argument("--embedding-npy", required=True)
+    cluster.add_argument("--output-json", help="Save evaluation metrics as JSON")
     cluster.set_defaults(func=evaluate_cluster_summary)
 
     align = sub.add_parser("external-alignment")
     align.add_argument("--rows-jsonl", required=True)
     align.add_argument("--clusters-jsonl", required=True)
     align.add_argument("--label-field", default="label_vector")
-    align.add_argument("--max-pairs", type=int, default=200000)
+    align.add_argument("--max-pairs", type=positive_int, default=200000)
     align.add_argument("--seed", type=int, default=13)
+    align.add_argument("--output-json", help="Save evaluation metrics as JSON")
     align.set_defaults(func=evaluate_external_alignment)
 
     args = parser.parse_args()
@@ -276,4 +284,4 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(cli_entry(main))
